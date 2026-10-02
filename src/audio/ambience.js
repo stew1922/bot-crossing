@@ -1,5 +1,6 @@
 import { SOUNDS } from './sounds.js'
 import { createNoiseBuffers, SampleVoice } from './synth.js'
+import { busLevels, isAlert } from './mix.js'
 
 /**
  * The colony's sound, built on the Web Audio API and nothing else.
@@ -53,6 +54,8 @@ const NO_WORLD = Object.freeze({ night: 0, sources: EMPTY, water: null })
 const HALF_PI = Math.PI / 2
 /** What `play(name)` means with no options. Frozen: the event path has its own scratch object it mutates. */
 const PLAY_DEFAULTS = Object.freeze({ gain: 1 })
+/** Settings that move a fader. */
+const MIX_KEYS = ['masterVolume', 'ambienceVolume', 'effectsVolume', 'alertsVolume', 'alertsOnly']
 const rand = (lo, hi) => lo + Math.random() * (hi - lo)
 const clamp01 = (v) => (v < 0 ? 0 : v > 1 ? 1 : v)
 
@@ -65,6 +68,7 @@ export class Ambience {
     this.compressor = null
     this.ambienceBus = null
     this.effectsBus = null
+    this.alertsBus = null
 
     this._enabled = this._flag('sound', true)
     this._visible = typeof document === 'undefined' ? true : !document.hidden
@@ -241,7 +245,18 @@ export class Ambience {
 
   /** Play a sound once; in the world when given a position, otherwise straight to the ear. */
   play(name, opts) {
-    return this._shoot(name, opts || PLAY_DEFAULTS, this.effectsBus)
+    return this._shoot(name, opts || PLAY_DEFAULTS, isAlert(name) ? this.alertsBus : this.effectsBus)
+  }
+
+  /**
+   * An alert, on its own bus. Placed in the world like any other one-shot — except under
+   * "alerts only", where it is the only thing you will hear and so must not fade with distance
+   * from a bot that may be at the far edge of the map.
+   */
+  alert(name, opts) {
+    const placed = opts || PLAY_DEFAULTS
+    const flat = this._flag('alertsOnly', false) ? { gain: placed.gain ?? 1 } : placed
+    return this._shoot(name, flat, this.alertsBus)
   }
 
   /**
@@ -261,7 +276,7 @@ export class Ambience {
       return () => {}
     }
     const ctx = this.ctx
-    const voice = this._start(name, this.effectsBus, PLAY_DEFAULTS, true)
+    const voice = this._start(name, isAlert(name) ? this.alertsBus : this.effectsBus, PLAY_DEFAULTS, true)
     const g = voice.out.gain
     const now = ctx.currentTime
     const level = Math.max(0.0001, this._baseGain(name, voice))
@@ -361,7 +376,11 @@ export class Ambience {
 
   _onSettings(changed) {
     if (changed.has('sound')) this.setEnabled(this._flag('sound', true))
-    if (changed.has('masterVolume') || changed.has('ambienceVolume') || changed.has('effectsVolume')) this._applyVolumes()
+    if (MIX_KEYS.some((key) => changed.has(key))) this._applyVolumes()
+  }
+
+  _levels() {
+    return busLevels((key) => this.settings?.get?.(key))
   }
 
   _buildMixer() {
@@ -383,19 +402,20 @@ export class Ambience {
     master.gain.value = this._vol('masterVolume', 0.6)
     master.connect(mute)
 
-    const ambienceBus = ctx.createGain()
-    ambienceBus.gain.value = this._vol('ambienceVolume', 0.8)
-    ambienceBus.connect(master)
-
-    const effectsBus = ctx.createGain()
-    effectsBus.gain.value = this._vol('effectsVolume', 0.8)
-    effectsBus.connect(master)
+    const levels = this._levels()
+    const bus = (level) => {
+      const node = ctx.createGain()
+      node.gain.value = level
+      node.connect(master)
+      return node
+    }
 
     this.compressor = compressor
     this.mute = mute
     this.master = master
-    this.ambienceBus = ambienceBus
-    this.effectsBus = effectsBus
+    this.ambienceBus = bus(levels.ambience)
+    this.effectsBus = bus(levels.effects)
+    this.alertsBus = bus(levels.alerts)
   }
 
   _applyMute() {
@@ -408,8 +428,10 @@ export class Ambience {
     if (!this.master) return
     const now = this.ctx.currentTime
     this.master.gain.setTargetAtTime(this._vol('masterVolume', 0.6), now, 0.05)
-    this.ambienceBus.gain.setTargetAtTime(this._vol('ambienceVolume', 0.8), now, 0.05)
-    this.effectsBus.gain.setTargetAtTime(this._vol('effectsVolume', 0.8), now, 0.05)
+    const levels = this._levels()
+    this.ambienceBus.gain.setTargetAtTime(levels.ambience, now, 0.05)
+    this.effectsBus.gain.setTargetAtTime(levels.effects, now, 0.05)
+    this.alertsBus.gain.setTargetAtTime(levels.alerts, now, 0.05)
   }
 
   _wake() {

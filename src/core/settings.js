@@ -185,6 +185,9 @@ const DEFAULTS = {
   masterVolume: 0.6,
   ambienceVolume: 0.8,
   effectsVolume: 0.8,
+  alertsVolume: 0.8,
+  /** Silence ambience and effects, keep the chime — for a colony that should only speak when needed. */
+  alertsOnly: false,
 
   // Behaviour
   autoQuality: true, // drop render scale when frames get expensive

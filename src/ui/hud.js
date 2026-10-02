@@ -2,6 +2,7 @@ import { PRESETS, PLANETS_ORDER } from './hud-data.js'
 import { PLANETS } from '../world/planet.js'
 import { TIMES, systemTimeOfDay } from '../world/sky.js'
 import { STATUS_LABEL } from '../game/colony.js'
+import { NICKNAME_MAX } from '../game/nicknames.js'
 import { FACE, FRAME_COLS, FRAME_ROWS } from '../agents/faces.js'
 import { PLOT_PALETTE, hashString } from '../world/plots.js'
 
@@ -27,6 +28,7 @@ const IS_WIN = /Win/.test(navigator.platform)
 const FILE_MANAGER = IS_MAC ? 'Finder' : IS_WIN ? 'Explorer' : 'Files'
 
 const ICON = {
+  pencil: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M4 20h4L19 9l-4-4L4 16z"/><path d="M13.5 6.5l4 4"/></svg>`,
   settings: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.6a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>`,
   eye: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7-10-7-10-7z"/><circle cx="12" cy="12" r="3"/></svg>`,
   eyeOff: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"><path d="M9.9 4.24A9.1 9.1 0 0 1 12 4c6.5 0 10 7 10 7a18.5 18.5 0 0 1-2.16 3.19M6.6 6.6C4.06 8.2 2 11 2 11s3.5 7 10 7a9.7 9.7 0 0 0 5.4-1.6"/><path d="M14.12 14.12a3 3 0 1 1-4.24-4.24M2 2l20 20"/></svg>`,
@@ -318,7 +320,13 @@ export class Hud {
       ),
       this._slider('Master', 'masterVolume', 0, 1, 0.05, (v) => `${Math.round(v * 100)}%`),
       this._slider('Ambience', 'ambienceVolume', 0, 1, 0.05, (v) => `${Math.round(v * 100)}%`, 'Beds and the sounds of the world.'),
-      this._slider('Effects', 'effectsVolume', 0, 1, 0.05, (v) => `${Math.round(v * 100)}%`, 'Hammering, drones, splashes, the chime when somebody needs you.')
+      this._slider('Effects', 'effectsVolume', 0, 1, 0.05, (v) => `${Math.round(v * 100)}%`, 'Hammering, drones, splashes, the bots chattering back.'),
+      this._slider('Alerts', 'alertsVolume', 0, 1, 0.05, (v) => `${Math.round(v * 100)}%`, 'The chime when somebody needs you.'),
+      this._toggle(
+        'Alerts only',
+        'alertsOnly',
+        'Silence the ambience and effects and keep just the chime, at full volume wherever the bot is.'
+      )
     )
     body.appendChild(sound)
   }
@@ -457,6 +465,7 @@ export class Hud {
     on('#btn-viewed', 'click', () => this.actions.markViewed?.())
     on('#btn-archive', 'click', () => this.actions.archiveThread?.())
     on('#btn-deselect', 'click', () => this.actions.select?.(null))
+    on('#btn-rename', 'click', () => this.startRename())
     on('#btn-follow', 'click', () => this.settings.set('followSelected', !this.settings.get('followSelected')))
     on('#btn-new-session', 'click', () => this.actions.newConversation?.())
     on('#btn-reveal', 'click', () => this.actions.revealProject?.())
@@ -683,6 +692,50 @@ export class Hud {
    * one thread and its repo are the same context, and splitting them across the screen made
    * you look in two places to act on one astronaut.
    */
+  _showTitle(thread) {
+    const el = this.$('.thread-pop .title')
+    el.textContent = thread.title || 'Untitled thread'
+    // Nicknamed: the harness's own title is one hover away.
+    el.title = thread.realTitle ? `Nickname — in ${thread.harnessName || 'its harness'}: ${thread.realTitle}` : ''
+  }
+
+  /**
+   * Edit the selected bot's nickname in place. Enter or leaving the field keeps it, Escape
+   * abandons it, and an empty name clears the nickname so the thread's own title returns.
+   */
+  startRename() {
+    const thread = this.selected?.thread
+    if (!thread || this._renaming) return
+    this._renaming = thread.id
+    const el = this.$('.thread-pop .title')
+    const input = document.createElement('input')
+    input.type = 'text'
+    input.className = 'rename'
+    input.maxLength = NICKNAME_MAX
+    input.value = thread.realTitle ? thread.title : ''
+    input.placeholder = thread.realTitle || thread.title || 'Nickname'
+    input.setAttribute('aria-label', 'Nickname')
+    el.replaceChildren(input)
+    input.focus()
+    input.select()
+
+    let done = false
+    const finish = (keep) => {
+      if (done) return
+      done = true
+      const id = this._renaming
+      this._renaming = null
+      if (keep && id === this.selected?.thread?.id) this.actions.renameThread?.(input.value)
+      if (this.selected?.thread) this._showTitle(this.selected.thread)
+    }
+    input.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') finish(true)
+      else if (e.key === 'Escape') finish(false)
+      e.stopPropagation()
+    })
+    input.addEventListener('blur', () => finish(true))
+  }
+
   setSelection(agent, thread) {
     const card = this.$('.thread-pop')
     // Only ever one accent button in the panel: whichever action is the immediate one.
@@ -697,7 +750,9 @@ export class Hud {
     // On a phone the card docks above the sheet's peek, so the sheet drops to make room.
     if (this.isPhone()) this.toggleSheet(false)
 
-    this.$('.thread-pop .title').textContent = thread.title || 'Untitled thread'
+    // A poll re-renders the card every 15 seconds; a name half-typed must survive it.
+    if (this._renaming && this._renaming !== thread.id) this._renaming = null
+    if (!this._renaming) this._showTitle(thread)
     const status = STATUS_LABEL[agent.status] || agent.status
     const meta = this.$('.thread-pop .meta')
     const bits = [
@@ -1135,6 +1190,7 @@ const TEMPLATE = `
       <div class="title"></div>
       <div class="meta"></div>
     </div>
+    <button class="btn icon ghost" id="btn-rename" title="Nickname this bot" aria-label="Nickname this bot">${ICON.pencil}</button>
     <button class="btn icon ghost" id="btn-follow" title="Follow selected bot" aria-label="Follow selected bot" aria-pressed="false">${ICON.locate}</button>
     <button class="btn icon ghost" id="btn-deselect" title="Deselect (Esc)">${ICON.close}</button>
   </div>

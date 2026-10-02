@@ -25,6 +25,7 @@ import {
 } from './game/api.js'
 import { hideProject, hiddenCatalog, unhideProject } from './game/hidden-projects.js'
 import { withErrands } from './game/errands.js'
+import { applyNicknames, setNickname } from './game/nicknames.js'
 
 /**
  * Boot and the outer game loop.
@@ -61,7 +62,7 @@ engine.setPlanetGrade(PLANETS[settings.get('planet')]?.grade)
 const rig = new CameraRig(engine.camera, engine.canvas, settings)
 const colony = new Colony(engine.scene, settings, engine.camera, engine.renderer)
 
-let state = { archived: [], archivedAt: {}, opened: [], plots: {}, seen: {}, hiddenProjects: [], viewedAt: {} }
+let state = { archived: [], archivedAt: {}, opened: [], plots: {}, seen: {}, hiddenProjects: [], viewedAt: {}, nicknames: {} }
 let threads = []
 /** Last legend built for the bottom bar, kept so the open zone's chip can light up between polls. */
 let legendProjects = []
@@ -207,6 +208,21 @@ const actions = {
     queueSave()
     applyThreads(threads)
     hud.toast(`Marked ${thread.title.slice(0, 40)} as viewed`)
+  },
+
+  /**
+   * Give the selected bot a name of the colony's own. Kept in data/colony.json, never written to
+   * the harness; an empty name clears it and the thread's own title comes back.
+   */
+  renameThread: (name) => {
+    const thread = threads.find((t) => t.id === selectedId)
+    if (!thread) return
+    const nicknames = setNickname(state.nicknames || {}, thread.id, name)
+    if (nicknames[thread.id] === (state.nicknames || {})[thread.id]) return
+    state = { ...state, nicknames }
+    queueSave()
+    applyThreads(threads)
+    hud.toast(nicknames[thread.id] ? `Renamed to ${nicknames[thread.id]}` : `Back to ${thread.realTitle ?? thread.title}`)
   },
 
   hideProject: () => {
@@ -909,7 +925,7 @@ function applyThreads(list) {
     drag.pendingThreads = list
     return
   }
-  list = withErrands(list)
+  list = applyNicknames(withErrands(list), state.nicknames)
 
   // A thread you have said you looked at stops counting as unread until it moves on again.
   // Done here rather than in `statusFor` so the card, the badge and the astronaut all agree.
@@ -988,7 +1004,7 @@ function chimeForNewWaiting(list, archivedSet, hiddenSet) {
       if (waitingBefore.has(id) || now - lastChime < 2500) continue
       lastChime = now
       const agent = colony.agentFor(id)
-      ambience.play('chime-attention', agent ? { x: agent.pos.x, y: agent.pos.y + 1, z: agent.pos.z, gain: 0.9 } : { gain: 0.9 })
+      ambience.alert('chime-attention',agent ? { x: agent.pos.x, y: agent.pos.y + 1, z: agent.pos.z, gain: 0.9 } : { gain: 0.9 })
     }
   }
   seenFirstRoster = true
