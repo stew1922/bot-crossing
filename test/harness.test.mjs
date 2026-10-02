@@ -16,7 +16,7 @@ import opencode from '../server/harnesses/opencode.mjs'
 import { HARNESSES } from '../server/harnesses/index.mjs'
 import codex from '../server/harnesses/codex.mjs'
 import claudeCode from '../server/harnesses/claude-code.mjs'
-import { readTail, findExecutable } from '../server/lib/fsutil.mjs'
+import { readTail, findExecutable, processAlive } from '../server/lib/fsutil.mjs'
 import { schemeOf } from '../server/lib/xdg.mjs'
 import { withEnv, withPlatform, fakeExecutable } from './support/env.mjs'
 
@@ -234,6 +234,10 @@ async function fakeClaudeWithErrands(errandRecords) {
 
 async function claudeWithErrands(home) {
   process.env.HOME = home
+  // Windows finds the home folder through USERPROFILE, not HOME, so name both stores outright.
+  process.env.CLAUDE_CONFIG_DIR = path.join(home, '.claude')
+  // And never the real desktop app's store, which would put this machine's threads first.
+  process.env.BOT_CROSSING_CLAUDE_DESKTOP = path.join(home, 'no-desktop-app')
   const mod = await import(`../server/harnesses/claude-code.mjs?${home}`)
   return mod.default
 }
@@ -678,6 +682,87 @@ test('a record the app still holds outranks a leftover deletion marker', async (
   await fsp.rm(fx.root, { recursive: true, force: true })
 })
 
+/** A transcript record big enough that a few hundred of them outgrow the head the scan reads. */
+const filler = (i) => ({
+  type: 'assistant',
+  timestamp: '2026-09-07T12:00:01.000Z',
+  message: { role: 'assistant', content: [{ type: 'text', text: `step ${i} ${'.'.repeat(1024)}` }], stop_reason: 'end_turn' },
+})
+const padding = (n, from = 0) => Array.from({ length: n }, (_, i) => filler(from + i))
+const customTitle = (title) => ({ type: 'custom-title', customTitle: title, sessionId: SESSION_ID })
+
+test('a thread renamed deep into a long transcript carries its new name', async () => {
+  // Claude Code appends the rename where it happens and re-states it near the end; a scan that
+  // only reads the head of a long transcript never sees either and keeps the first prompt.
+  const fx = await fakeClaude({
+    transcript: [
+      typed('model opus'),
+      { type: 'ai-title', aiTitle: 'Model Opus', sessionId: SESSION_ID },
+      ...padding(300),
+      customTitle('Etsy'),
+      ...padding(300, 300),
+      customTitle('Etsy'),
+      ...padding(5, 600),
+    ],
+  })
+  const h = await claudeWith(fx)
+  const [t] = await h.scanThreads()
+  assert.equal(t.title, 'Etsy')
+  await fsp.rm(fx.root, { recursive: true, force: true })
+})
+
+const desktopRecord = (extra) => ({
+  sessionId: 'local_2df3987c-02d3-405e-b8f5-da30e3835213',
+  cliSessionId: SESSION_ID,
+  cwd: '/tmp/demo',
+  title: 'Recovered',
+  createdAt: 1,
+  lastActivityAt: 2,
+  lastFocusedAt: 3,
+  ...extra,
+})
+
+test('an error the session has since worked past is not reported', async () => {
+  // The desktop app records a failed start and never clears it, even once the session runs.
+  const fx = await fakeClaude({
+    transcript: [typed('carry on')],
+    records: [desktopRecord({ error: 'Unable to start session. Sign in again', errorAt: Date.now() - 60 * 60 * 1000 })],
+  })
+  const h = await claudeWith(fx)
+  const [t] = await h.scanThreads()
+  assert.equal(t.hasError, false)
+  await fsp.rm(fx.root, { recursive: true, force: true })
+})
+
+test('an error newer than any work is still reported', async () => {
+  const fx = await fakeClaude({
+    transcript: [typed('carry on')],
+    records: [desktopRecord({ error: 'Rate limited', errorAt: Date.now() + 60 * 1000 })],
+  })
+  const h = await claudeWith(fx)
+  const [t] = await h.scanThreads()
+  assert.equal(t.hasError, true)
+  await fsp.rm(fx.root, { recursive: true, force: true })
+})
+
+test('an error with no time on it is believed', async () => {
+  const fx = await fakeClaude({ transcript: [typed('carry on')], records: [desktopRecord({ error: 'Broken' })] })
+  const h = await claudeWith(fx)
+  const [t] = await h.scanThreads()
+  assert.equal(t.hasError, true)
+  await fsp.rm(fx.root, { recursive: true, force: true })
+})
+
+test('the latest rename wins over an earlier one', async () => {
+  const fx = await fakeClaude({
+    transcript: [typed('start'), customTitle('First name'), filler(0), customTitle('Second name'), filler(1)],
+  })
+  const h = await claudeWith(fx)
+  const [t] = await h.scanThreads()
+  assert.equal(t.title, 'Second name')
+  await fsp.rm(fx.root, { recursive: true, force: true })
+})
+
 /**
  * Kilo Code's store keeps whatever path the machine gave it, so the fixture uses one that is
  * absolute *here* rather than a Windows path pinned in place. The adapter refuses a cwd that is
@@ -835,4 +920,55 @@ test('kilocode refuses untrusted refs and opens the repo folder in VS Code', asy
     delete process.env.KILO_DB
     await fsp.rm(home, { recursive: true, force: true })
   }
+})
+
+test('a process that refuses the probe is alive — only ESRCH means it is gone', () => {
+  const refusing = (code) => () => {
+    throw Object.assign(new Error(code), { code })
+  }
+  // Windows answers EPERM for a process it will not let us signal — one started elevated.
+  assert.equal(processAlive(28360, refusing('EPERM')), true)
+  assert.equal(processAlive(28360, refusing('ESRCH')), false)
+  assert.equal(processAlive(28360, () => true), true)
+  assert.equal(processAlive(0, () => true), false)
+  assert.equal(processAlive('28360', () => true), false)
+})
+
+/** A live-session registry entry for this very process, so the pid probe finds it alive. */
+async function registerLive(fx, status) {
+  const dir = path.join(fx.configDir, 'sessions')
+  await fsp.mkdir(dir, { recursive: true })
+  const record = { pid: process.pid, sessionId: SESSION_ID, cwd: '/tmp/demo', ...(status && { status }) }
+  await fsp.writeFile(path.join(dir, `${process.pid}.json`), JSON.stringify(record))
+}
+
+const toolResult = { type: 'user', message: { role: 'user', content: [{ type: 'tool_result', content: 'ok' }] } }
+const turnEnded = { type: 'system', subtype: 'turn_duration' }
+
+test('the CLI saying it is idle means waiting, however the transcript happens to end', async () => {
+  // A turn can end on a tool result with no closing message; the transcript alone reads that
+  // as mid-turn, but the CLI knows it is back at the prompt.
+  const fx = await fakeClaude({ transcript: [typed('analyse it'), toolResult, turnEnded] })
+  await registerLive(fx, 'idle')
+  const [t] = await (await claudeWith(fx)).scanThreads()
+  assert.equal(t.running, false)
+  assert.equal(t.unread, true)
+  await fsp.rm(fx.root, { recursive: true, force: true })
+})
+
+test('the CLI saying it is busy means working', async () => {
+  const done = { type: 'assistant', message: { content: [{ type: 'text', text: 'done' }], stop_reason: 'end_turn' } }
+  const fx = await fakeClaude({ transcript: [typed('analyse it'), done] })
+  await registerLive(fx, 'busy')
+  const [t] = await (await claudeWith(fx)).scanThreads()
+  assert.equal(t.running, true)
+  await fsp.rm(fx.root, { recursive: true, force: true })
+})
+
+test('with no status from the CLI, the transcript still decides', async () => {
+  const fx = await fakeClaude({ transcript: [typed('analyse it'), toolResult] })
+  await registerLive(fx, '')
+  const [t] = await (await claudeWith(fx)).scanThreads()
+  assert.equal(t.running, true, 'a tool result with nothing after it is mid-turn')
+  await fsp.rm(fx.root, { recursive: true, force: true })
 })

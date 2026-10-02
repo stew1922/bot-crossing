@@ -113,3 +113,20 @@ export const num = (v) => {
   const n = Number(v)
   return Number.isFinite(n) ? n : 0
 }
+
+/**
+ * Whether `pid` names a process that exists, by sending it signal 0.
+ *
+ * Only ESRCH means it is gone. EPERM means it exists and we may not signal it — which is what
+ * Windows answers for a process started elevated, such as a CLI session in an Administrator
+ * terminal — so it counts as alive. `kill` is injectable for the tests.
+ */
+export function processAlive(pid, kill = process.kill.bind(process)) {
+  if (!Number.isInteger(pid) || pid <= 0) return false
+  try {
+    kill(pid, 0)
+    return true
+  } catch (err) {
+    return err?.code === 'EPERM'
+  }
+}

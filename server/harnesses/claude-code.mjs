@@ -18,7 +18,7 @@ import fsp from 'node:fs/promises'
 import { existsSync, readdirSync } from 'node:fs'
 import path from 'node:path'
 import os from 'node:os'
-import { exists, findExecutable, jsonLines, listDirs, listFiles, num, readHead, readTail } from '../lib/fsutil.mjs'
+import { exists, findExecutable, jsonLines, listDirs, listFiles, num, processAlive, readHead, readTail } from '../lib/fsutil.mjs'
 
 const HOME = os.homedir()
 
@@ -173,8 +173,9 @@ function cleanPrompt(s) {
 function readTranscriptMeta(records) {
   const meta = { customTitle: '', aiTitle: '', summary: '', firstPrompt: '', cwd: '', gitBranch: '', startedAt: 0 }
   for (const r of records) {
-    if (!meta.customTitle && r.customTitle) meta.customTitle = r.customTitle
-    if (!meta.aiTitle && r.aiTitle) meta.aiTitle = r.aiTitle
+    // Titles are the exception to first-wins: a thread can be renamed, and the newest name is it.
+    if (r.customTitle) meta.customTitle = r.customTitle
+    if (r.aiTitle) meta.aiTitle = r.aiTitle
     if (!meta.summary && r.type === 'summary' && r.summary) meta.summary = r.summary
     if (!meta.cwd && r.cwd) meta.cwd = r.cwd
     if (!meta.gitBranch && r.gitBranch && r.gitBranch !== 'HEAD') meta.gitBranch = r.gitBranch
@@ -273,6 +274,51 @@ async function awaitingReply(file) {
   return false
 }
 
+/**
+ * The names a thread carries *now*, from the end of its transcript.
+ *
+ * A rename is appended where it happens, which in a long session is far past the head — and the
+ * CLI re-states the current title near the end as it goes. So the tail is where the live name
+ * is, and it outranks whatever the head said. Only fields actually found are returned.
+ */
+async function latestTitles(file) {
+  const { customTitle, aiTitle } = readTranscriptMeta(jsonLines(await readTail(file, TAIL_BYTES)))
+  return { ...(customTitle && { customTitle }), ...(aiTitle && { aiTitle }) }
+}
+
+/**
+ * How long after an error the transcript may still move without that counting as recovery —
+ * the failing turn itself can land in the file a moment after the app records the error.
+ */
+const ERROR_GRACE_MS = 60 * 1000
+
+/**
+ * Whether the desktop record's `error` still describes the thread.
+ *
+ * The app writes `error` when a session fails — a stale sign-in at start is the common one — and
+ * never clears it, even after the session goes on to work for hours. A transcript that has moved
+ * since `errorAt` is the session having got past it. An error with no time on it is believed.
+ */
+function errorStillCurrent(record, transcriptMtime) {
+  if (!record.error) return false
+  const errorAt = num(record.errorAt)
+  if (!errorAt || !transcriptMtime) return true
+  return transcriptMtime <= errorAt + ERROR_GRACE_MS
+}
+
+/**
+ * Whether a live session has handed the turn back to you.
+ *
+ * The CLI says so itself in its registry, and that outranks the transcript: a turn can end on a
+ * tool result with no closing message, which the transcript alone reads as mid-turn. Only a CLI
+ * that reports no status falls back to reading the transcript's end.
+ */
+async function turnIsYours(reportedStatus, transcriptFile) {
+  if (reportedStatus === 'idle') return true
+  if (reportedStatus === 'busy') return false
+  return transcriptFile ? awaitingReply(transcriptFile) : false
+}
+
 /** Transcript metadata is expensive to parse, so keep it until the file changes. */
 const metaCache = new Map()
 async function transcriptMeta(entry) {
@@ -281,6 +327,7 @@ async function transcriptMeta(entry) {
   let meta
   try {
     meta = readTranscriptMeta(jsonLines(await readHead(entry.file, HEAD_BYTES)))
+    meta = { ...meta, ...(await latestTitles(entry.file)) }
   } catch {
     meta = readTranscriptMeta([])
   }
@@ -289,11 +336,13 @@ async function transcriptMeta(entry) {
 }
 
 /**
- * Sessions with a CLI process actually alive right now. The registry keeps files for
- * processes that have exited, so every pid is probed before it counts.
+ * Sessions with a CLI process actually alive right now, each with the status the CLI last
+ * reported for it — `busy` mid-turn, `idle` back at the prompt, or '' from a CLI too old to
+ * say. The registry keeps files for processes that have exited, so every pid is probed before
+ * it counts.
  */
 async function scanLiveSessions() {
-  const live = new Set()
+  const live = new Map()
   for (const file of await listFiles(CLI_LIVE, (n) => n.endsWith('.json'))) {
     let record
     try {
@@ -302,12 +351,7 @@ async function scanLiveSessions() {
       continue
     }
     if (!record.sessionId || !record.pid) continue
-    try {
-      process.kill(record.pid, 0) // signal 0 only tests for existence
-      live.add(record.sessionId)
-    } catch {
-      /* process is gone */
-    }
+    if (processAlive(record.pid)) live.set(record.sessionId, typeof record.status === 'string' ? record.status : '')
   }
   return live
 }
@@ -524,7 +568,7 @@ async function scanThreads() {
       recordActivityAt: num(s.lastActivityAt) || num(s.lastFocusedAt) || num(s.createdAt) || 0,
       lastFocusedAt: num(s.lastFocusedAt),
       hasLiveProcess: live.has(cliSessionId),
-      hasError: Boolean(s.error),
+      hasError: errorStillCurrent(s, entry?.mtime),
       starred: s.isStarred === true,
       routine: s.scheduledTaskId || '',
       prState: s.prState || '',
@@ -610,8 +654,7 @@ async function scanThreads() {
     const seenAt = thread.recordActivityAt ?? thread.lastActivityAt
     thread.unread = thread.desktopSessionIds.length > 0 && seenAt > thread.lastFocusedAt
     const fresh = now - thread.lastActivityAt < ACTIVE_WINDOW_MS
-    const waiting =
-      thread.hasLiveProcess && fresh && thread.transcriptFile ? await awaitingReply(thread.transcriptFile) : false
+    const waiting = thread.hasLiveProcess && fresh ? await turnIsYours(live.get(thread.cliSessionId), thread.transcriptFile) : false
     thread.running = thread.hasLiveProcess && fresh && !waiting
     // A thread that handed the turn back wants you, whether or not the desktop app has ever seen
     // it — the only way a terminal-only thread can ask for anything at all.
@@ -649,12 +692,7 @@ async function liveSessionPid(sessionId) {
       continue
     }
     if (record.sessionId !== sessionId || !record.pid) continue
-    try {
-      process.kill(record.pid, 0)
-      return record.pid
-    } catch {
-      /* process is gone */
-    }
+    if (processAlive(record.pid)) return record.pid
   }
   return 0
 }

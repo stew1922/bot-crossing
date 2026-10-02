@@ -33,11 +33,14 @@ test('asked for a terminal, present never opens the app instead', async () => {
   assert.match((await present({ ok: true, url: '', command: gone }, 'terminal')).error, /not on this machine/)
 })
 
-test('asked for a terminal on Windows, present says so rather than trying', async () => {
-  const command = { argv: ['/bin/true'], cwd: os.tmpdir() }
+// Windows does open terminals now (server/lib/win-terminal.mjs), so this only proves the refusal
+// that comes before any spawn: a valid command here would open a real window on the machine
+// running the tests.
+test('asked for a terminal on Windows, a command that is not an absolute path is refused unspawned', async () => {
+  const command = { argv: ['claude'], cwd: os.tmpdir() }
   const shown = await withPlatform('win32', () => present({ ok: true, url: '', command }, 'terminal'))
   assert.equal(shown.ok, false)
-  assert.match(shown.error, /Windows/)
+  assert.match(shown.error, /Invalid launch command/)
 })
 
 test("an adapter's own refusal passes through whatever the page asked for", async () => {
